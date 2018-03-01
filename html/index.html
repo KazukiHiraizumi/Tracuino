@@ -1,0 +1,301 @@
+<html>
+<meta content="text/html; charset=utf-8" http-equiv="Content-Type">
+<script src="../jquery-1.6.4.min.js"></script>
+<script src="usbserial.js"></script>
+
+<body>
+
+<input readonly type="text" id="message" style="width:25%;"></input>
+<input type="hidden" id="msg_connect" value="接続状態"></input>
+<input type="hidden" id="msg_conerr" value="接続できません"></input>
+<input type="hidden" id="msg_discon" value="切断状態"></input>
+<input type="hidden" id="msg_fjxerr" value="応答がありません"></input>
+<button id="connect">Connect</button>
+<button id="disconnect">Disconnect</button>
+
+<table style="width:100%;">
+<tr><td style="width:40%;"><textarea id="input" rows="20" wrap="off">
+:0
+byte step
+word tm1
+byte tm2
+word pha
+word D110
+byte D111
+word D112
+:1
+word D200
+word D201
+</textarea>
+</td>
+<td valign="top">
+<table id="output">
+</table>
+</td></tr></table>
+
+<script type="text/javascript">
+var Watch = function(rc){
+  if(arguments.length==0) return;
+  rc=rc.trim();
+  if(rc=='') return;
+
+  var delim=new RegExp('[ \\t]','g');
+  var tok=rc.split(delim);
+
+  if(tok.length<2) return;
+
+  if(tok[0]=='unsigned'){
+    this.sign=false;
+    if(tok[1]=='long'){
+      this.bit=2;
+    }
+    else if(tok[1]=='int'){
+      this.bit=1;
+    }
+    this.name=new String(tok[2]);
+  }
+  else{
+    if(tok[0]=='byte'){
+      this.sign=false;
+      this.bit=0;
+    }
+    else if(tok[0]=='char'){
+      this.sign=true;
+      this.bit=0;
+    }
+    else if(tok[0]=='word'){
+      this.sign=false;
+      this.bit=1;
+    }
+    else if(tok[0]=='short' || tok[0]=='int' ){
+      this.sign=true;
+      this.bit=1;
+    }
+    else if(tok[0]=='long'){
+      this.sign=true;
+      this.bit=2;
+    }
+    else{
+      console.log('Watch :ctor/type error');
+      return;
+    }
+    this.name=new String(tok[1]);
+    console.log('Watch :name '+tok[1]);
+    if(this.name.charAt(this.name.length-1)=='*') this.scan=10000000;
+  }
+  this.seg=Watch.prefix.seg;
+  this.ofs=Watch.prefix.ofs;
+  Watch.prefix.ofs+=1<<this.bit;
+  Watch.stack.push(this);
+}
+Watch.stack=null;
+Watch.prefix={seg:0,ofs:0};
+Watch.read={point:0,value:0};
+Watch.write={point:null,value:null};
+Watch.wait=100;
+Watch.queue=true;
+Watch.prototype={
+  name:null, bit:null, sign:null, seg:0, ofs:0, hex:0, scan:1,
+  sethex:function(val){
+    this.hex=val;
+    if(this.sign){
+      if(val<0){
+        switch(this.bit){
+        case 0:
+          return this.hex=0x100+val;
+        case 1:
+          return this.hex=0x10000+val;
+        case 2:
+          return this.hex=0x100000000+val;
+        }
+      }
+    }
+    else if(val<0) return this.hex=0;
+  },
+  value:function(){
+    if(!this.sign) return this.hex;
+    switch(this.bit){
+    case 0:
+      return this.hex>=0x80? this.hex-0x100:this.hex;
+    case 1:
+      return this.hex>=0x8000? this.hex-0x10000:this.hex;
+    case 2:
+      return this.hex>=0x80000000? this.hex-0x100000000:this.hex;
+    }
+  }
+}
+
+function parse(){
+	var elm=$('textarea#input').get(0);//DOM?
+	var cont=elm.value;
+	var sln=cont.substring(0,elm.selectionStart).split('\n').length;
+	var pat=new RegExp('\n','gi');
+	var lstr=cont.split(pat);
+	var stack=new Array();
+	Watch.stack=new Array();
+	Watch.prefix={seg:0,ofs:0};
+	Watch.read.point=Watch.read.value=0;
+	Watch.write.point=Watch.write.value=null;
+	Watch.queue=true;
+	for(var i=0;;i++){
+		if(lstr[i]==null) break;
+		var rc=lstr[i].trim();
+//		console.log('lstr.trim '+rc+'/'+rc.charAt(0));
+		if(rc.charAt(0)==':'){
+			Watch.prefix.seg=parseInt(rc.substring(1));
+			Watch.prefix.ofs=0;
+			continue;
+		}
+		stack.push(new Watch(rc));
+	}
+//Change CSS
+	$('table#output').empty();
+	for(var i=0;i<Watch.stack.length;i++){
+		var w=Watch.stack[i];
+		$('table#output').append('<tr><td>'+w.name+'</td><td nowrap><input readonly size="6" class="disp" id="'+i+'"></input><button class="copy" id="'+i+'">&rarr;</button></td><td><div class="popup" style="display:none;" id="'+i+'"><input size="6" class="edit" id="'+i+'"></input><button class="set" id="'+i+'">&radic;</button><button class="abort" id="'+i+'">&times;</button></div></td></tr>');
+	}
+	$('button.copy').click(function(e){
+		var id=$(e.target).attr('id');
+//		console.log('pop color:'+$('div.popup:eq('+id+')').css('display'));
+		$('div.popup:eq('+id+')').css('display','inline');
+		$('input.edit:eq('+id+')').val($('input.disp:eq('+id+')').val());
+	});
+	$('button.abort').click(function(e){
+		var id=$(e.target).attr('id');
+		$('div.popup:eq('+id+')').css('display','none');
+	});
+	$('button.set').click(function(e){
+		var id=$(e.target).attr('id');
+		Watch.write.value=$('input.edit:eq('+id+')').val();
+		Watch.write.point=id;
+		if(!Watch.queue) writeData();
+	});
+}
+
+var	ser=new USBSerial();
+function hexStr(dat){
+	var i=0;
+	for(;dat.charCodeAt(i)!=0xF0;i++) if(i==dat.length-1) return;
+	i++;
+	if(dat.charCodeAt(i)==0x57){ //FJAX reply
+		i++;
+		var s='';
+		for(;dat.charCodeAt(i)!=0xF7 && i<dat.length;i++){
+			s+=String.fromCharCode(dat.charCodeAt(i));
+		}
+		return s;
+	}
+	return '';
+}
+function scanStart(){
+	for(var i=0;i<Watch.stack.length;i++){
+		if(Watch.stack[i].scan==0) Watch.stack[i].scan=1;
+	}
+	Watch.read.point=0;
+	Watch.queue=true;
+	queueNext();
+}
+function queueNext(){
+	var s='\xF0';
+	var wp=Watch.stack[Watch.read.point];
+	s+=String.fromCharCode(0x50+wp.bit);
+	s+=String.fromCharCode(wp.seg);
+	s+=String.fromCharCode(wp.ofs);
+	s+='\xF7';
+	ser.send(s);
+	ser.wdt=10;
+}
+function writeData(){
+	var s='\xF0';
+	var wp=Watch.stack[Watch.write.point];
+	wp.sethex(parseInt(Watch.write.value));
+	s+=String.fromCharCode(0x54+wp.bit);
+	s+=String.fromCharCode(wp.seg);
+	s+=String.fromCharCode(wp.ofs);
+	s+=wp.hex.toString(16);
+	s+='\xF7';
+	Watch.read.point=Watch.write.point;
+	Watch.write.point=null;
+	ser.send(s);
+	ser.wdt=10;
+}
+function readReply(e){
+	var wp=Watch.stack[Watch.read.point];
+	if(e!=null){
+		wp.hex=parseInt(hexStr(e),16);
+		$('input.disp'+'#'+Watch.read.point).val(wp.value());
+	}
+	else console.log('no reply');
+	if(Watch.write.point!=null){
+		writeData();
+	}
+	else if(Watch.queue){
+		var wro=Watch.read.point;
+		while(true){
+			var w=Watch.stack[Watch.read.point];
+			if(w.scan>0){
+				w.scan--;
+				queueNext();
+				return;
+			}
+			Watch.read.point++;
+			if(Watch.read.point>=Watch.stack.length) Watch.read.point=0;
+			if(Watch.read.point==wro) break;
+		}
+		Watch.queue=false;
+	}
+}
+
+$(document).ready(function(){
+//handlers
+	ser.onConnect=function(){
+		$('table#output > *').remove();
+		parse();
+		console.log('connect good');
+		scanStart();
+	}
+	ser.onReceive=function(str){
+		console.log('on rec:'+ab2hex(str2ab(str)));
+		readReply(str);
+	}
+	ser.onReceiveError=function(e){
+		Watch.queue=false;
+		console.log('re err:'+e);
+	}
+	ser.onTimeout=function(){
+		Watch.queue=false;
+		console.log('timeout');
+	}
+//web storage
+//	storage.get('watch',function(e){
+//		$('textarea#input').get(0).value=e.watch;
+//	});
+	$('#connect').click(function(e){
+//		storage.set({watch:$('textarea#input').get(0).value},function(){
+//			console.log('strage set:');
+//		});
+		if(ser.device==null){
+			try{
+				ser.connect([{ 'vendorId': 0x2341, 'productId': 0x8036 }]); //Arduino Leonardo
+				$('#message').val($('#msg_connect').val()).css('color','#008888');
+			}
+			catch(e){}
+		}
+		else startScan();
+	});
+	$('#disconnect').click(function(){
+		if(ser.device!=null){
+			try{
+				ser.disconnect();
+				$('#message').val($('#msg_discon').val()).css('color','#008888');
+			}
+			catch(e){}
+		}
+		Watch.queue=false;
+	});
+});
+
+</script>
+
+</body>
+</html>
